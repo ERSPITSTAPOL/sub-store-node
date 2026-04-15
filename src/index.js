@@ -9,7 +9,6 @@ import PROXY_PRODUCERS from './sub/backend/src/core/proxy-utils/producers/index.
 // import { safeLoad, safeDump } from './core/utils/yaml.js';
 // import PROXY_PRODUCERS from './core/producers/index.js';
 
-ProxyUtils.parse('dHJvamFuOi8vMmVhZGI5MmQtMTIwYi00OTllLTg3MDctYTg4ZTZhZDA4OWE5QDAuMC4wLjA6NDQzP3NlY3VyaXR5PXRscyZzbmk9ZXhhbXBsZS5jb20mZnA9Y2hyb21lJnR5cGU9d3MmaG9zdD0mcGF0aD0lMkYlM0ZlZCUzRDIwNDgmYWxwbj1oMyMlRTYlQkYlODAlRTYlQjQlQkJwZWdneQ==')
 /**
  * 订阅转换入口
  * @param {Array<string>} urlArray - 输入订阅URL数组
@@ -60,7 +59,7 @@ async function processSingleInput(input, platform, index, globalNameCount) {
     let headers = {};
     const isHttpInput = /^https?:\/\//i.test(input);
     if (isHttpInput) {
-        const response = await fetchResponse(input, 'v2ray');
+        const response = await fetchResponse(input, 'clash.meta');
         headers = response?.headers ?? {};
         data = response?.data ?? response;
     }
