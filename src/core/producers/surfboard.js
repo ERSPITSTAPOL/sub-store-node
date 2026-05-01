@@ -28,6 +28,8 @@ export default function Surfboard_Producer() {
                 return anytls(proxy);
             case 'wireguard-surge':
                 return wireguard(proxy);
+            case 'hysteria2':
+                return hysteria2(proxy);
         }
         throw new Error(
             `Platform ${targetPlatform} does not support proxy type: ${proxy.type}`,
@@ -222,6 +224,29 @@ function wireguard(proxy) {
         `,section-name=${proxy['section-name']}`,
         'section-name',
     );
+
+    return result.toString();
+}
+
+function hysteria2(proxy) {
+    const result = new Result(proxy);
+    result.append(`${proxy.name}=${proxy.type},${proxy.server},${proxy.port}`);
+    result.appendIfPresent(`,password=${proxy.password}`, 'password');
+    if (isPresent(proxy, 'ports')) {
+        result.append(`,port-hopping=${proxy.ports}`);
+    }
+    result.appendIfPresent(
+        `,port-hopping-interval=${proxy['hop-interval']}`,
+        'hop-interval',
+    );
+    result.appendIfPresent(`,upload-bandwidth=${proxy.up}`, 'up');
+    result.appendIfPresent(`,download-bandwidth=${proxy.down}`, 'down');
+    result.appendIfPresent(`,sni=${proxy.sni}`, 'sni');
+    result.appendIfPresent(
+        `,skip-cert-verify=${proxy['skip-cert-verify']}`,
+        'skip-cert-verify',
+    );
+    result.append(`,udp-relay=true`);
 
     return result.toString();
 }
