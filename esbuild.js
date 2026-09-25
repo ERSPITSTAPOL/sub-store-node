@@ -4,7 +4,48 @@ const { build } = require('esbuild');
 
 const objectHasOwnPolyfill = require.resolve('core-js/actual/object/has-own');
 
+function patchSubmodule() {
+    const openApiPath = path.resolve('src/sub/backend/src/vendor/open-api.js');
+    if (fs.existsSync(openApiPath)) {
+        let src = fs.readFileSync(openApiPath, 'utf8');
+
+        src = src.replace(
+            /const\s+isNode\s*=\s*eval\([^)]+\)\s*;/,
+            'const isNode = false;'
+        );
+
+        fs.writeFileSync(openApiPath, src);
+        console.log('✔️ 已修补: open-api.js');
+    } else {
+        console.warn('⚠️ 未找到: open-api.js，跳过修补');
+    }
+}
+
+const shimPlugin = {
+    name: 'shim',
+    setup(build) {
+        const pkgShims = [
+            'fastestsmallesttextencoderdecoder',
+            'dns-packet',
+            'jsrsasign',
+            'age-encryption',
+        ];
+        for (const pkg of pkgShims) {
+            build.onResolve({ filter: new RegExp(`^${pkg}$`) }, () => ({
+                path: pkg,
+                namespace: 'empty-shim',
+            }));
+        }
+        build.onLoad({ filter: /.*/, namespace: 'empty-shim' }, () => ({
+            contents: 'export default {}',
+            loader: 'js',
+        }));
+    },
+};
+
 !(async () => {
+    patchSubmodule();
+
     const pkg = JSON.parse(await fs.promises.readFile('./src/sub/backend/package.json', 'utf8'));
     const version = pkg.version;
     const mainVersion = JSON.parse(fs.readFileSync(path.join(__dirname, 'package.json'), 'utf-8')).version.trim();
@@ -20,10 +61,21 @@ const objectHasOwnPolyfill = require.resolve('core-js/actual/object/has-own');
             platform: 'browser',
             format: 'esm',
             outfile: artifact.dest,
+            external: [
+                'fs',
+                'net',
+                'tls',
+                'dgram',
+                'child_process',
+                'stream/promises',
+                'stream',
+                'buffer'
+            ],
             inject: [objectHasOwnPolyfill],
             define: {
                 __VERSION__: `"${version}"`,
             },
+            plugins: [shimPlugin],
         });
 
         fs.writeFileSync(
