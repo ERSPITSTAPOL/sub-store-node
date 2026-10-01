@@ -2,31 +2,15 @@ import { ProxyUtils } from './sub/backend/src/core/proxy-utils/index.js';
 import PROXY_PRODUCERS from './sub/backend/src/core/proxy-utils/producers/index.js';
 import YAML from 'yaml';
 
-/**
- * 处理节点转换请求
- *
- * 接收节点数组或订阅地址，按照目标平台转换节点格式，
- * 支持返回完整转换数据或包含节点名称的数据结构。
- *
- * @param {Array<string>|string} urlArray - 输入的节点内容或订阅地址数组
- * @param {string} platform - 目标平台类型（如 mihomo、clash 等）
- * @param {boolean} api - 是否以 API 格式返回数据（包含 names 字段）
- * @param {boolean} heruser - 获取返回流量信息
- *
- * @returns {Promise<{
- *   status: number,
- *   data: any,
- *   headers: object|Array
- * }>} 节点转换结果
- *
- * @throws {Error} 节点处理过程中发生异常时捕获并返回错误信息
- */
-export default async function processNodeConversion(urlArray, platform, api, heruser) {
+const HOP_BY_HOP_HEADERS = new Set(['transfer-encoding', 'content-length', 'content-encoding', 'connection']);
+const USER_AGENT_REGEX = /(?:clash|meta|mihomo|ray)/i;
+const BASE64_REGEX = /^[A-Za-z0-9+/]+[=]{0,3}$/;
+
+export default async function processNodeConversion(urlArray, platform, userAgent) {
     const results = {
         data: {},
         headers: [],
     };
-    urlArray = Array.isArray(urlArray) ? urlArray : [urlArray];
     if (!urlArray || urlArray.length === 0) {
         results.status = 400;
         results.data = '输入节点数组不能为空';
@@ -34,22 +18,15 @@ export default async function processNodeConversion(urlArray, platform, api, her
     }
     if (!PROXY_PRODUCERS[platform]) {
         results.status = 400;
-        results.data = `目标平台：不支持 ${platform}！`;
+        results.data = `目标平台：不支持 ${platform}!`;
         return results;
     }
     try {
-        const { names, data, headers } = await produceArtifact(urlArray, platform, heruser);
-        api
-            ? (results.data = {
-                names,
-                data,
-            })
-            : (results.data = data);
-        if (headers.length) {
-            const userInfoHeaders = headers.filter((h) => h?.['subscription-userinfo']);
-            const candidates = userInfoHeaders.length ? userInfoHeaders : headers;
-            results.headers = candidates[Math.floor(Math.random() * candidates.length)];
-        }
+        const globalNameCount = new Map();
+        const processedResults = await Promise.all(
+            urlArray.map((input, index) => processSingleInput(input, platform, index, globalNameCount, userAgent))
+        );
+        mergeResults(results, processedResults);
     } catch (error) {
         results.status = 500;
         results.data = `处理节点失败：${error.message}`;
@@ -59,124 +36,148 @@ export default async function processNodeConversion(urlArray, platform, api, her
     return results;
 }
 
-/**
- * @description 根据订阅 URL 获取代理节点，
- * 解析、去重节点名称，并根据目标平台生成对应订阅格式
- * @param {string|string[]} urls 订阅地址
- * @param {string} platform 输出平台类型
- * @param {boolean} heruser 是否获取流量信息
- * @returns {Object|string} 生成后的订阅数据
- */
-async function produceArtifact(urls, platform, heruser) {
-    let data = [],
-        headers = [];
-    const responseProxies = [],
-        validUrls = [],
-        invalidUrls = [];
-    const url = (Array.isArray(urls) ? urls : [urls]).map((i) => i.split(',')).flat();
+async function processSingleInput(input, platform, index, globalNameCount, userAgent) {
+    let data = input;
+    let headers = {};
+    const isHttpInput = /^https?:\/\//i.test(input);
 
-    url.forEach((item) => {
-        if (isUrl(item)) {
-            validUrls.push(item);
-        } else {
-            invalidUrls.push(item);
-        }
-    });
-    if (invalidUrls.length) {
-        const currentProxies = invalidUrls
-            .map((i) => ProxyUtils.parse(i))
-            .flat()
-            .filter(Boolean);
-
-        if (currentProxies.length) {
-            responseProxies.push(currentProxies);
-        }
+    if (isHttpInput) {
+        const response = await fetchResponse(input, userAgent);
+        headers = response?.headers ?? {};
+        data = response?.data ?? response;
     }
 
-    const responses = await Promise.all(
-        validUrls.map((url) =>
-            heruser
-                ? Promise.all([fetchResponse(url, 'v2ray'), fetchResponse(url, 'clashmeta')])
-                : fetchResponse(url, 'v2ray').then((res) => [res, res]),
-        ),
-    );
-
-    for (const [dataRes, headerRes] of responses) {
-        if (!dataRes?.data) continue;
-        const raw = dataRes.data;
-        let currentProxies = (Array.isArray(raw) ? raw : [raw]).map((i) => ProxyUtils.parse(i)).flat();
-        responseProxies.push(currentProxies);
-        headers.push(headerRes.headers);
+    if (data && typeof data === 'object' && data.proxies) {
+        const produced = ProxyUtils.produce(data.proxies, platform);
+        return { data: produced, headers, index };
     }
-    data = responseProxies.flat();
-    const nameCount = {};
-    data.forEach((item) => {
-        const name = item.name;
 
-        if (nameCount[name] === undefined) {
-            nameCount[name] = 0;
-        } else {
-            nameCount[name]++;
-            item.name = `${name} [${nameCount[name]}]`;
-        }
-    });
-    let names = [];
-    let index = 0;
-    for (const proxies of responseProxies) {
-        const currentNames = [];
+    const proxies = ProxyUtils.parse(data) || [];
+    const deduped = deduplicateWithGlobalMap(Array.isArray(proxies) ? proxies : [proxies], globalNameCount);
+    const produced = ProxyUtils.produce(deduped, platform);
 
-        for (const proxy of proxies) {
-            currentNames.push(data[index].name);
-            index++;
-        }
-
-        names.push(currentNames);
-    }
-    data = ProxyUtils.produce(data, platform);
-    data = testJSON(data);
-    if (['mihomo', 'clash', 'meta', 'clashmeta', 'clash.meta'].includes(platform.toLowerCase())) {
-        data = YAML.parse(data);
-    }
-    return { names, data, headers };
+    return { data: produced, headers, index };
 }
 
-/**
- * 获取远程响应
- * @param {string} url - 要获取的URL
- * @param {string} userAgent - 自定义User-Agent
- * @returns {Promise<{status: number, headers: Object, data: any}>} 包含状态码、响应头和数据的对象
- */
-async function fetchResponse(url, userAgent) {
-    if (!userAgent) {
-        userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3';
+function mergeResults(results, processedResults) {
+    let textdata = '';
+    let hasBase64 = false;
+    let objectDataArray = null;
+    let headerCount = 0;
+
+    for (let i = 0, len = processedResults.length; i < len; i++) {
+        const { data, headers } = processedResults[i];
+
+        if (typeof data === 'string') {
+            if (isBase64(data)) {
+                hasBase64 = true;
+                textdata += base64DecodeUtf8(data) + '\n';
+            } else {
+                let loaded = null;
+                try {
+                    loaded = YAML.parse(data, { maxAliasCount: -1, merge: true });
+                } catch {}
+
+                if (loaded && typeof loaded === 'object') {
+                    const keys = Object.keys(loaded);
+                    for (let k = 0, kLen = keys.length; k < kLen; k++) {
+                        const key = keys[k];
+                        const val = loaded[key];
+                        if (key === '0') {
+                            if (!objectDataArray) objectDataArray = [];
+                            objectDataArray.push(val);
+                        } else if (Array.isArray(val)) {
+                            if (!Array.isArray(results.data[key])) {
+                                results.data[key] = [];
+                            }
+                            results.data[key].push(...val);
+                        }
+                    }
+                } else {
+                    results.data = data;
+                }
+            }
+        } else {
+            results.data = data;
+        }
+
+        if (headers) {
+            for (const _ in headers) {
+                if (Math.random() * ++headerCount < 1) {
+                    results.headers = headers;
+                }
+                break;
+            }
+        }
     }
+
+    if (hasBase64) {
+        results.data = base64EncodeUtf8(textdata);
+    }
+
+    if (objectDataArray) {
+        results.data = objectDataArray;
+    }
+
+    if (results.data.proxies) {
+        results.data = YAML.stringify(results.data, { lineWidth: 0 });
+    }
+}
+
+function deduplicateWithGlobalMap(proxies, globalNameCount) {
+    for (let i = 0, len = proxies.length; i < len; i++) {
+        const proxy = proxies[i];
+        const baseName = proxy.name || 'node';
+        const newCount = (globalNameCount.get(baseName) ?? -1) + 1;
+
+        globalNameCount.set(baseName, newCount);
+        proxy.name = newCount === 0 ? baseName : `${baseName} [${newCount}]`;
+    }
+    return proxies;
+}
+
+async function fetchResponse(url, userAgent) {
+    userAgent = (userAgent && USER_AGENT_REGEX.test(String(userAgent)))
+        ? userAgent
+        : 'ClashMetaForAndroid';
+
     let response;
     try {
         response = await fetch(url, {
             method: 'GET',
-            headers: {
+            headers: { 
                 'User-Agent': userAgent,
+                'Accept': 'text/plain,application/yaml,application/json,*/*'
             },
         });
     } catch (error) {
-        console.error(error);
-        return true;
+        throw new Error(
+            `Failed to fetch subscription: ${url}: ${error instanceof Error ? error.message : String(error)}`
+        );
     }
-    const rawHeaders = Object.fromEntries(response.headers.entries());
-    const hopByHopHeaders = ['transfer-encoding', 'content-length', 'content-encoding', 'connection'];
+
+    if (!response.ok) {
+        throw new Error(
+            `Failed to fetch subscription: ${url}: HTTP ${response.status} ${response.statusText}`
+        );
+    }
+
     const headers = {};
-    for (const [key, value] of Object.entries(rawHeaders)) {
-        if (!hopByHopHeaders.includes(key.toLowerCase())) {
+    response.headers.forEach((value, key) => {
+        if (!HOP_BY_HOP_HEADERS.has(key.toLowerCase())) {
             headers[key] = value;
         }
-    }
+    });
+
     const textData = await response.text();
-    let data;
-    try {
-        data = YAML.parse(textData, { maxAliasCount: -1, merge: true });
-    } catch {
+    let data = textData;
+
+    if (textData.includes('proxies')) {
         try {
-            data = JSON.parse(textData);
+            const tempParsed = YAML.parse(textData, { maxAliasCount: -1, merge: true });
+            if (tempParsed && typeof tempParsed === 'object') {
+                data = tempParsed.proxies ? { proxies: tempParsed.proxies } : tempParsed;
+            }
         } catch {
             data = textData;
         }
@@ -189,30 +190,18 @@ async function fetchResponse(url, userAgent) {
     };
 }
 
-/**
- * 判断字符串是否为有效的 HTTP/HTTPS URL
- *
- * @param {string} str - 待检测的字符串
- * @returns {boolean} 是否为有效 URL
- */
-function isUrl(str) {
-    try {
-        const url = new URL(str);
-        return ['http:', 'https:'].includes(url.protocol);
-    } catch {
-        return false;
-    }
+const isBase64 = (str) => {
+    return str.length % 4 === 0 && BASE64_REGEX.test(str);
 }
 
-/**
- *
- * @param {string} 转化数据类型
- * @returns 转化后的数据
- */
-function testJSON(data) {
-    try {
-        return JSON.parse(data);
-    } catch {
-        return data;
-    }
+function base64EncodeUtf8(str) {
+    const bytes = new TextEncoder('utf-8').encode(str);
+    const binary = String.fromCharCode.apply(null, bytes);
+    return btoa(binary);
+}
+
+function base64DecodeUtf8(str) {
+    const binary = atob(str);
+    const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
+    return new TextDecoder('utf-8').decode(bytes);
 }
